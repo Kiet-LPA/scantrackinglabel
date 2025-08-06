@@ -6,6 +6,7 @@ import csv
 import easyocr
 import torch
 import winsound
+import re
 
 # ========== CẤU HÌNH ==========
 VIDEO_DIR = 'videos'
@@ -35,12 +36,13 @@ last_check = 0
 
 print("🚀 Camera đã bật. Đang theo dõi sản phẩm...")
 
-def extract_tracking_number(texts):
-    for _, raw_text, _ in texts:
-        cleaned = raw_text.replace(" ", "").strip()
-        if 10 <= len(cleaned) <= 30 and cleaned.isalnum():
-            return cleaned
-    return None
+def extract_tracking_number_and_conf(texts):
+    for _, raw_text, conf in texts:
+        # Tìm chuỗi số dài từ 10–20 chữ số
+        matches = re.findall(r'\d{10,30}', raw_text.replace(" ", ""))
+        if matches:
+            return matches[0], conf
+    return None, 0
 
 # ========== MAIN LOOP ==========
 while True:
@@ -70,57 +72,57 @@ while True:
         for box, text, conf in results:
             print(f"  📌 '{text}' (conf: {conf:.2f})")
 
-        detected_tracking = extract_tracking_number(results)
+        tracking, confidence = extract_tracking_number_and_conf(results)
 
-        if detected_tracking:
-            if detected_tracking == current_tracking:
-                # Đã thấy mã cũ tiếp tục
-                duration = now - tracking_start_time
-                if duration >= 2.0 and detected_tracking not in scanned_trackings:
-                    timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-                    video_name = f"{detected_tracking}_{timestamp}.mp4"
-                    video_path = os.path.join(VIDEO_DIR, video_name)
-
-                    try:
-                        with open(CSV_FILE, 'a', newline='', encoding='utf-8') as f:
-                            csv.writer(f).writerow([f'="{detected_tracking}"', timestamp, video_path, "shipped"])
-                    except PermissionError:
-                        print("❌ Không thể ghi vào CSV (đang mở?)")
-                        continue
-
-                    scanned_trackings.add(detected_tracking)
-                    print(f"✅ Mã ổn định: {detected_tracking} → quay video...")
-
-                    winsound.Beep(1000, 200)
-
-                    # Quay video 4 giây
-                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                    out = cv2.VideoWriter(video_path, fourcc, 20.0, (frame.shape[1], frame.shape[0]))
-                    start = time.time()
-                    while time.time() - start < 4:
-                        ret, f = cap.read()
-                        if not ret:
-                            break
-                        out.write(f)
-                    out.release()
-                    print(f"🎞️ Đã lưu video: {video_name}")
-
-                    # Reset
-                    current_tracking = None
-                    tracking_start_time = None
-
-                else:
-                    print(f"⏳ Mã '{detected_tracking}' đang ổn định ({duration:.1f}s)...")
+        if tracking:
+            if tracking not in scanned_trackings:
+                if tracking != current_tracking:
+                    current_tracking = tracking
+                    tracking_start_time = now
+                    print(f"⏳ Đang theo dõi mã: {tracking}")
                     roi_color = (0, 255, 255)
+                else:
+                    duration = now - tracking_start_time
+                    if duration >= 2.0 or confidence >= 0.85:
+                        timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+                        video_name = f"{tracking}_{timestamp}.mp4"
+                        video_path = os.path.join(VIDEO_DIR, video_name)
+
+                        try:
+                            with open(CSV_FILE, 'a', newline='', encoding='utf-8') as f:
+                                csv.writer(f).writerow([f'="{tracking}"', timestamp, video_path, "shipped"])
+                        except PermissionError:
+                            print("❌ Không thể ghi vào file CSV (đang mở?)")
+                            continue
+
+                        scanned_trackings.add(tracking)
+                        current_tracking = None
+                        tracking_start_time = None
+
+                        print(f"✅ Mã hợp lệ (conf {confidence:.2f}, duration {duration:.1f}s): {tracking} → quay video...")
+
+                        winsound.Beep(1000, 200)
+
+                        # Quay video 4 giây
+                        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                        out = cv2.VideoWriter(video_path, fourcc, 20.0, (frame.shape[1], frame.shape[0]))
+                        start = time.time()
+                        while time.time() - start < 4:
+                            ret, f = cap.read()
+                            if not ret:
+                                break
+                            out.write(f)
+                        out.release()
+                        print(f"🎞️ Đã lưu video: {video_name}")
+                    else:
+                        print(f"⚠️ Mã '{tracking}' OCR chưa đủ điều kiện (conf {confidence:.2f}, duration {duration:.1f}s) — không lưu.")
+
             else:
-                # Mã khác hoặc lần đầu phát hiện
-                print(f"🎯 Phát hiện mã mới: {detected_tracking}")
-                current_tracking = detected_tracking
-                tracking_start_time = now
-                roi_color = (0, 255, 255)
+                print(f"🔁 Đã quét mã này rồi: {tracking}")
         else:
             current_tracking = None
             tracking_start_time = None
+
 
         last_check = now
 
