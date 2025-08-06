@@ -4,7 +4,6 @@ import os
 import datetime
 import csv
 import easyocr
-import re
 import torch
 
 # ========== CẤU HÌNH ==========
@@ -36,8 +35,8 @@ print("🚀 Camera đã bật. Đang theo dõi sản phẩm...")
 # ========== HÀM TÁCH MÃ TRACKING ==========
 def extract_tracking_number(texts):
     for _, raw_text, _ in texts:
-        cleaned = re.sub(r'\D', '', raw_text)  # chỉ giữ số
-        if 10 <= len(cleaned) <= 26:
+        cleaned = raw_text.replace(" ", "").strip()
+        if 10 <= len(cleaned) <= 30:
             return cleaned
     return None
 
@@ -47,10 +46,19 @@ while True:
     if not ret:
         continue
 
+    h, w, _ = frame.shape
+
+    # Vẽ khung ROI tracking ở dưới (tuỳ chỉnh nếu cần)
+    roi_top = int(h * 0.82)
+    roi_bottom = int(h * 0.95)
+    roi_left = int(w * 0.15)
+    roi_right = int(w * 0.85)
+
+    roi = frame[roi_top:roi_bottom, roi_left:roi_right]
+    cv2.rectangle(frame, (roi_left, roi_top), (roi_right, roi_bottom), (0, 255, 0), 2)
+
     now = time.time()
     if now - last_check >= interval:
-        h, w, _ = frame.shape
-        roi = frame[int(h * 0.45):int(h * 0.75), int(w * 0.05):int(w * 0.95)]  # cắt vùng giữa
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (3, 3), 0)
         _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -69,9 +77,13 @@ while True:
                 video_name = f"{tracking}_{timestamp}.mp4"
                 video_path = os.path.join(VIDEO_DIR, video_name)
 
-                # Ghi log ngay
-                with open(CSV_FILE, 'a', newline='', encoding='utf-8') as f:
-                    csv.writer(f).writerow([tracking, timestamp, video_path, "shipped"])
+                try:
+                    with open(CSV_FILE, 'a', newline='', encoding='utf-8') as f:
+                        csv.writer(f).writerow([f'="{tracking}"', timestamp, video_path, "shipped"])
+                except PermissionError:
+                    print("❌ Không thể ghi vào file CSV (đang mở?)")
+                    continue
+
                 scanned_trackings.add(tracking)
 
                 print(f"✅ Mã mới: {tracking} → bắt đầu quay video...")
@@ -92,8 +104,9 @@ while True:
 
         last_check = now
 
-    # Hiển thị camera
+    # Hiển thị giao diện + vùng tracking
     cv2.imshow("🚚 ScanLabelTracking", frame)
+    cv2.imshow("🔍 ROI Tracking", roi)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
