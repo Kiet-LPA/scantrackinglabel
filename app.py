@@ -7,7 +7,7 @@ import re
 import datetime
 import pandas as pd
 import streamlit as st
-
+from db import insert_event, get_shipments, get_events, upsert_device, ping
 # ============ CẤU HÌNH ============
 CSV_FILE = "tracking_log.csv"
 VIDEO_DIR = "videos"
@@ -34,6 +34,15 @@ except Exception:
 # ============ STREAMLIT SETUP ============
 st.set_page_config(page_title="ScanLabelTracking", layout="wide")
 st.title("ScanLabelTracking - Printiz")
+# --- Kiểm tra DB và khai báo device ---
+DB_OK, DB_ERR = ping(detail=True)
+if not DB_OK:
+    st.error(f"Không kết nối được MySQL: {DB_ERR}")
+else:
+    st.success("MySQL OK")
+
+# Tạo/lấy device_id 1 lần cho phiên này (chỉ khi DB_OK)
+DEVICE_ID = upsert_device(name="Cam 01 - Line A", location="Cổng ra", camera_info="USB Cam #0") if DB_OK else None
 
 # ============ SESSION STATE ============
 def _ensure_state():
@@ -117,6 +126,39 @@ def append_csv_row(tracking: str, timestamp: str, video_path: str, status: str):
         if not file_exists:
             writer.writeheader()
         writer.writerow(row)
+# ============ DB HELPER ============
+ALLOWED_STATUSES = {"finished","shipped","invalid","duplicate"}
+
+def _normalize_status(s: str | None) -> str:
+    if not s: 
+        return "shipped"
+    # "barcode_shipped" / "ocr_shipped" -> "shipped"
+    if s.endswith("_shipped"):
+        return "shipped"
+    if s.endswith("_finished"):
+        return "finished"
+    return s if s in ALLOWED_STATUSES else "shipped"
+
+def save_db_event(tracking_number: str, video_path: str, source: str,
+                  confidence: float | None, stable_ms: int, status_label: str):
+    status_db = _normalize_status(status_label)
+    ok, info = insert_event(
+        tracking=tracking_number,
+        status=status_db,
+        video_path=video_path,
+        device_id=DEVICE_ID,
+        source=source or "unknown",
+        confidence=round(confidence * 100, 2) if isinstance(confidence, float) else confidence,
+        duration_stable_ms=stable_ms,
+        notes=None
+    )
+    if ok:
+        st.success(f"Đã lưu DB: {tracking_number}")
+    else:
+        if info == "duplicate_event":
+            st.info("Bỏ qua: sự kiện trùng (DB).")
+        else:
+            st.error(f"Lưu DB lỗi: {info}")
 
 # ============ DELETE HELPERS ============
 def delete_entry(ts: str, video_path: str, delete_file: bool = False) -> bool:
@@ -168,6 +210,7 @@ def render_table(placeholder):
             st.info("Chưa có bản ghi nào.")
             return
 
+        # Bảng trên cùng
         df_display = df.copy()
         df_display["tracking"] = (
             df_display["tracking"].astype(str)
@@ -176,42 +219,58 @@ def render_table(placeholder):
         )
         st.dataframe(df_display, use_container_width=True)
 
-        # KHÔNG dùng key cứng cho checkbox để tránh duplicate key khi re-render
         delete_file_toggle = st.checkbox("🗑️ Xoá cả file video khi xoá bản ghi", value=False)
 
-        st.markdown("#### ⬇️ Tải video / Xoá")
-        for i, row in df.iterrows():
-            ts = str(row["timestamp"])
-            vid_path = str(row["video"])
-            tracking_clean = str(row["tracking"]).replace('="', "").removesuffix('"')
+        # ===== Khung có thanh cuộn
+        SCROLL_H = 420  # đổi chiều cao tuỳ ý
+        with st.expander("⬇️ Tải video / Xoá", expanded=True):
+            # anchor để CSS target đúng expander content
+            st.markdown('<div id="dl-scroll-anchor"></div>', unsafe_allow_html=True)
 
-            cols = st.columns([3, 3, 4, 1, 1])
-            cols[0].markdown(f"**Tracking:** {tracking_clean}")
-            cols[1].markdown(f"**Time:** `{ts}`")
+            for i, row in df.iterrows():
+                ts = str(row["timestamp"])
+                vid_path = str(row["video"])
+                tracking_clean = str(row["tracking"]).replace('="', "").removesuffix('"')
 
-            if os.path.exists(vid_path):
-                with open(vid_path, "rb") as f:
-                    video_bytes = f.read()
-                cols[2].download_button(
-                    label=f"Tải {os.path.basename(vid_path)}",
-                    data=video_bytes,
-                    file_name=os.path.basename(vid_path),
-                    mime="video/mp4",
-                    key=f"dl-{i}-{ts}-{os.path.basename(vid_path)}",
-                )
-            else:
-                cols[2].error("❌ File không tồn tại")
+                cols = st.columns([3, 3, 4, 1, 1])
+                cols[0].markdown(f"**Tracking:** {tracking_clean}")
+                cols[1].markdown(f"**Time:** `{ts}`")
 
-            cols[3].markdown(f"**{row['status']}**")
-
-            if cols[4].button("Xoá", key=f"del-{i}-{ts}-{os.path.basename(vid_path)}"):
-                if delete_entry(ts, vid_path, delete_file_toggle):
-                    st.success(f"Đã xoá tracking {tracking_clean}")
-                    st.session_state.refresh_table = False  # không cần dùng nữa
-                    st.rerun()  # <--- rerun toàn bộ app, bảng sẽ render lại 1 lần
+                if os.path.exists(vid_path):
+                    with open(vid_path, "rb") as f:
+                        video_bytes = f.read()
+                    cols[2].download_button(
+                        label=f"Tải {os.path.basename(vid_path)}",
+                        data=video_bytes,
+                        file_name=os.path.basename(vid_path),
+                        mime="video/mp4",
+                        key=f"dl-{i}-{ts}-{os.path.basename(vid_path)}",
+                    )
                 else:
-                    st.warning("Không tìm thấy bản ghi để xoá.")
+                    cols[2].error("❌ File không tồn tại")
 
+                cols[3].markdown(f"**{row['status']}**")
+
+                if cols[4].button("Xoá", key=f"del-{i}-{ts}-{os.path.basename(vid_path)}"):
+                    if delete_entry(ts, vid_path, delete_file_toggle):
+                        st.success(f"Đã xoá tracking {tracking_clean}")
+                        st.rerun()
+                    else:
+                        st.warning("Không tìm thấy bản ghi để xoá.")
+
+            # CSS áp vào expander content (ổn định trên mọi bản Streamlit)
+            st.markdown(f"""
+            <style>
+              /* giới hạn chiều cao + cuộn */
+              .streamlit-expanderContent:has(#dl-scroll-anchor) {{
+                  max-height: {SCROLL_H}px !important;
+                  overflow-y: auto !important;
+                  border: 1px solid rgba(49,51,63,.2);
+                  border-radius: .5rem;
+                  padding: 8px;
+              }}
+            </style>
+            """, unsafe_allow_html=True)
 
 # ============ VIDEO FINALIZER ============
 def finalize_recording(status_label="shipped"):
@@ -224,6 +283,7 @@ def finalize_recording(status_label="shipped"):
 
         vp = st.session_state.current_video_path
         if vp and os.path.exists(vp) and os.path.getsize(vp) > 0:
+            # CSV
             append_csv_row(
                 st.session_state.current_tracking,
                 st.session_state.current_timestamp,
@@ -232,6 +292,24 @@ def finalize_recording(status_label="shipped"):
             )
             saved = True
             st.session_state.refresh_table = True
+
+            # [DB] ghi vào MySQL
+            try:
+                # conf trung bình trong thời gian ổn định (nếu có)
+                avg_conf = (st.session_state._conf_sum / max(1, st.session_state._conf_cnt)) if st.session_state._conf_cnt else None
+                # nếu là barcode thì conf=1.0 (100)
+                if st.session_state.current_source == "barcode":
+                    avg_conf = 1.0
+                save_db_event(
+                    tracking_number=st.session_state.current_tracking,
+                    video_path=vp,
+                    source=st.session_state.current_source,
+                    confidence=avg_conf,
+                    stable_ms=2000,  # tuỳ chỉnh nếu bạn đổi tham số ổn định
+                    status_label=status_label
+                )
+            except Exception as e:
+                st.error(f"DB exception: {e}")
 
     # Reset trạng thái + cooldown (luôn chạy)
     st.session_state.last_seen_code = None
@@ -295,17 +373,26 @@ def try_decode_barcode(frame, full_frame=None):
 
 def _prep_for_ocr(img):
     h, w = img.shape[:2]
+    # cắt bớt phần trên/dưới – tuỳ nhãn của bạn, có thể chỉnh 0.20/0.80
     y1 = int(h * 0.15); y2 = int(h * 0.85)
     img = img[y1:y2, :]
 
     g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # tăng tương phản
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
     g = clahe.apply(g)
-    g = cv2.resize(g, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-    g = cv2.GaussianBlur(g, (3,3), 0)
+    # phóng lớn hơn để OCR tốt hơn
+    g = cv2.resize(g, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+    # unsharp mask (làm nét)
+    blur = cv2.GaussianBlur(g, (0,0), 1.0)
+    g = cv2.addWeighted(g, 1.5, blur, -0.5, 0)
+    # nhị phân hoá + đóng mở để sạch nhiễu
     g = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                              cv2.THRESH_BINARY, 21, 10)
+                              cv2.THRESH_BINARY, 31, 10)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+    g = cv2.morphologyEx(g, cv2.MORPH_CLOSE, kernel, iterations=1)
     return g
+
 
 def try_ocr(frame):
     if not HAVE_EASYOCR:
@@ -315,13 +402,20 @@ def try_ocr(frame):
     if reader is None:
         st.session_state.easyocr_reader = easyocr.Reader(["en"], gpu=False)
         reader = st.session_state.easyocr_reader
-    results = reader.readtext(pre, detail=1, allowlist='0123456789')
+    results = reader.readtext(
+        pre, detail=1, allowlist='0123456789',
+        width_ths=0.7,  # gộp các box gần nhau
+        link_threshold=0.3,
+        text_threshold=0.7,
+        low_text=0.4
+    )
     best = (None, 0.0)
     for _, text, conf in results:
         digits = re.sub(r"\D", "", text)
         if 10 <= len(digits) <= 30 and conf > best[1]:
             best = (digits, float(conf))
     return best
+
 
 # ============ UI TRÊN: TRÁI (điều khiển) / PHẢI (video) ============
 left, right = st.columns([1, 2])
@@ -332,21 +426,56 @@ with left:
 
     st.markdown("### ⚙️ Nhạy & Ổn định")
     STABLE_FRAMES = st.slider("Số frame ổn định (OCR)", 3, 30, 8, 1)
-    MIN_CONF      = st.slider("Ngưỡng tin cậy OCR", 0.50, 1.00, 0.70, 0.05)
+    MIN_CONF      = st.slider("Ngưỡng tin cậy OCR", 0.50, 1.00, 0.80, 0.05)
     GRACE_MS      = st.slider("Grace khi mất mã (ms)", 0, 800, 300, 50)
 
-    start_btn = st.empty()
-    stop_btn  = st.empty()
 
 with right:
     video_col = st.container()
     frame_placeholder = video_col.empty()
+# --- Hàm tìm camera khả dụng ---
+def detect_cameras(max_id=5):
+    found = []
+    for i in range(max_id + 1):
+        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)  # <-- thêm CAP_DSHOW
+        if cap.isOpened():
+            found.append(i)
+        cap.release()
+    return found
+
+# --- Khởi tạo session_state ---
+if "camera_id" not in st.session_state:
+    st.session_state.camera_id = 0
+if "camera_options" not in st.session_state:
+    st.session_state.camera_options = detect_cameras(5) or [0]
+
+# --- UI chọn camera ---
+with left:
+    st.markdown("### Camera")
+    st.session_state.camera_id = st.selectbox(
+        "Chọn camera",
+        st.session_state.camera_options,
+        index=st.session_state.camera_options.index(st.session_state.camera_id)
+        if st.session_state.camera_id in st.session_state.camera_options else 0
+    )
+    if st.button("🔎 Quét camera khả dụng"):
+        st.session_state.camera_options = detect_cameras(5) or [0]
+        st.rerun()
+
+    # rồi tới Start/Stop như mục (1)
 
 # ====== CALLBACKS ======
 def on_start():
-    st.session_state.cap = cv2.VideoCapture(0)
-    st.session_state.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
-    st.session_state.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 540)
+    # Nếu Windows, dùng CAP_DSHOW (an toàn cho mọi nền tảng vì có fallback)
+    st.session_state.cap = cv2.VideoCapture(st.session_state.camera_id, cv2.CAP_DSHOW)
+    st.session_state.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    st.session_state.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+    if not st.session_state.cap.isOpened():
+        st.error(f"Không mở được camera ID {st.session_state.camera_id}")
+        st.session_state.running = False
+        return
+
     st.session_state.running = True
     st.session_state.recording = False
     st.session_state.last_seen_code = None
@@ -369,16 +498,36 @@ def on_stop():
     st.session_state.recording = False
 
 with left:
-    start = start_btn.button("▶️ Bắt đầu", disabled=st.session_state.running, on_click=on_start)
-    stop  = stop_btn.button("⏹️ Dừng", disabled=not st.session_state.running, on_click=on_stop)
+    if st.button("▶️ Bắt đầu", disabled=st.session_state.running):
+        on_start()
+    if st.button("⏹️ Dừng", disabled=not st.session_state.running):
+        on_stop()
 
 # ====== BẢNG LOG Ở DƯỚI ======
 st.markdown("---")
 table_placeholder = st.container()
 render_table(table_placeholder)
+# ====== Xem nhanh từ MySQL ======
+with st.expander("📦 Danh sách lô hàng (last status)"):
+    search = st.text_input("Tìm theo tracking (optional)")
+    rows = get_shipments(limit=200, search=search or None)
+    df_rows = pd.DataFrame(rows)
+    if not df_rows.empty:
+        df_rows = df_rows.drop(columns=["last_confidence"], errors="ignore")
+    st.dataframe(df_rows, use_container_width=True)
+
+with st.expander("🧾 Lịch sử quét theo tracking"):
+    q = st.text_input("Nhập tracking để xem lịch sử")
+    if q:
+        history = get_events(q, limit=200)
+        df_hist = pd.DataFrame(history)
+        if not df_hist.empty:
+            df_hist = df_hist.drop(columns=["confidence"], errors="ignore")
+        st.dataframe(df_hist, use_container_width=True)
+
 
 # ============ LOOP CAMERA ============
-if st.session_state.running and st.session_state.cap:
+if st.session_state.running and st.session_state.cap and st.session_state.cap.isOpened():
     cap = st.session_state.cap
 
     while st.session_state.running:
@@ -487,16 +636,21 @@ if st.session_state.running and st.session_state.cap:
         # Nếu đang ghi → chỉ ghi frame, không OCR/barcode
         if st.session_state.recording:
             st.session_state.rec_writer.write(frame)
+
+            # đủ thời lượng thì finalize
             if (now - st.session_state.rec_start_time) >= CLIP_DURATION:
                 if finalize_recording(f"{st.session_state.current_source}_shipped" if st.session_state.current_source else "shipped"):
                     if st.session_state.avoid_duplicates:
                         st.session_state.scanned.add(st.session_state.current_tracking)
-            roi_color = (0, 0, 255)
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            # vẽ nhãn REC
+
+            # VẼ label TRƯỚC rồi mới convert RGB
             (l2, t2, r2, b2) = get_rois(frame)[3]
-            cv2.putText(frame, "RECORDING...", (l2, t2 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+            cv2.putText(frame, "RECORDING...", (l2, t2 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frame_placeholder.image(frame_rgb, channels="RGB")
+
             st.session_state.frame_idx += 1
             time.sleep(0.001)
             continue
